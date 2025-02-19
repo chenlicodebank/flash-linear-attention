@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Union
 import torch
 import torch.utils.checkpoint
 from torch import nn
-from transformers.activations import ACT2FN
 from transformers.generation import GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput, logging
@@ -17,9 +16,9 @@ from transformers.utils import ModelOutput, logging
 from fla.layers.attn import Attention
 from fla.models.mamba.modeling_mamba import MambaCache, MambaMixer
 from fla.models.samba.configuration_samba import SambaConfig
-from fla.modules import (FusedCrossEntropyLoss, FusedLinearCrossEntropyLoss,
-                         RMSNorm)
-from fla.modules.activations import swiglu_linear
+from fla.modules import FusedCrossEntropyLoss, FusedLinearCrossEntropyLoss
+from fla.modules import GatedMLP as SambaMLP
+from fla.modules import RMSNorm
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
@@ -27,46 +26,11 @@ if TYPE_CHECKING:
 logger = logging.get_logger(__name__)
 
 
-class SambaMLP(nn.Module):
-
-    def __init__(
-        self,
-        hidden_size: int,
-        hidden_ratio: Optional[int] = None,
-        hidden_act: str = 'swish'
-    ) -> SambaMLP:
-        super().__init__()
-
-        self.hidden_size = hidden_size
-        # the final number of params is `hidden_ratio * hidden_size^2`
-        # `intermediate_size` is chosen to be a multiple of 256 closest to `2/3 * hidden_size * hidden_ratio`
-        if hidden_ratio is None:
-            hidden_ratio = 4
-        self.hidden_ratio = hidden_ratio
-
-        self.intermediate_size = int(hidden_size * hidden_ratio * 2 / 3)
-        self.intermediate_size = 256 * ((self.intermediate_size + 256 - 1) // 256)
-
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size * 2, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        self.act_fn = ACT2FN[hidden_act]
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        **kwargs: Unpack[Dict],
-    ) -> torch.Tensor:
-        y = self.gate_proj(x)
-        gate, y = y.chunk(2, -1)
-        return swiglu_linear(gate, y, self.down_proj.weight, self.down_proj.bias)
-
-
 class SambaBlock(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
 
         self.config = config
-        self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
 
         self.mixer_norm = RMSNorm(hidden_size=config.hidden_size, eps=config.norm_eps)
@@ -75,6 +39,7 @@ class SambaBlock(nn.Module):
                 hidden_size=config.hidden_size,
                 num_heads=config.attn['num_heads'],
                 num_kv_heads=config.attn['num_kv_heads'],
+                qkv_bias=config.attn['qkv_bias'],
                 window_size=config.attn['window_size'],
                 rope_theta=config.attn['rope_theta'],
                 max_position_embeddings=config.max_position_embeddings,
@@ -82,11 +47,12 @@ class SambaBlock(nn.Module):
             )
         else:
             self.mixer = MambaMixer(config, layer_idx=layer_idx)
-        self.mlp_norm = RMSNorm(hidden_size=config.hidden_size, eps=config.norm_eps)
+        self.mlp_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(config.hidden_size, eps=config.norm_eps)
         self.mlp = SambaMLP(
             hidden_size=config.hidden_size,
             hidden_ratio=config.hidden_ratio,
-            hidden_act=config.hidden_act
+            hidden_act=config.hidden_act,
+            fuse_swiglu=config.fuse_swiglu
         )
 
     def forward(
@@ -102,7 +68,12 @@ class SambaBlock(nn.Module):
             hidden_states = self.mixer(hidden_states, cache_params=cache_params, **kwargs)
         else:
             hidden_states, _, cache_params = self.mixer(hidden_states=hidden_states, past_key_values=cache_params, **kwargs)
-        hidden_states, residual = self.mlp_norm(hidden_states, residual, True)
+        if self.config.fuse_norm:
+            hidden_states, residual = self.mlp_norm(hidden_states, residual, True)
+        else:
+            hidden_states = residual + hidden_states
+            residual = hidden_states
+            hidden_states = self.mlp_norm(hidden_states)
         hidden_states = self.mlp(hidden_states, **kwargs)
         hidden_states = residual + hidden_states
         return hidden_states
@@ -121,7 +92,12 @@ class SambaPreTrainedModel(PreTrainedModel):
 
     def _init_weights(self, module):
         """Initialize the weights."""
-        if isinstance(module, MambaMixer):
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
+            if module.bias is not None:
+                if not getattr(module.bias, "_no_reinit", False):
+                    nn.init.zeros_(module.bias)
+        elif isinstance(module, MambaMixer):
             module.A_log._no_weight_decay = True
             module.D._no_weight_decay = True
 
@@ -139,15 +115,12 @@ class SambaPreTrainedModel(PreTrainedModel):
             # # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
             inv_dt = dt + torch.log(-torch.expm1(-dt))
             with torch.no_grad():
-                module.dt_proj.bias.copy_(inv_dt)
+                module.dt_proj.bias.data = nn.Parameter(inv_dt.to(module.dt_proj.bias.device))
             module.dt_proj.bias._no_reinit = True
-
-        if isinstance(module, nn.Linear):
-            if module.bias is not None:
-                if not getattr(module.bias, "_no_reinit", False):
-                    nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, std=self.config.initializer_range)
+        elif hasattr(module, 'reset_parameters'):
+            module.reset_parameters()
 
         if self.config.rescale_prenorm_residual:
             # Reinitialize selected weights subject to the OpenAI GPT-2 Paper Scheme:
@@ -318,6 +291,8 @@ class SambaForCausalLM(SambaPreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.backbone = SambaModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.criterion = None
+
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -391,7 +366,7 @@ class SambaForCausalLM(SambaPreTrainedModel, GenerationMixin):
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        samba_outputs = self.backbone(
+        outputs = self.backbone(
             input_ids,
             cache_params=cache_params,
             inputs_embeds=inputs_embeds,
@@ -400,37 +375,36 @@ class SambaForCausalLM(SambaPreTrainedModel, GenerationMixin):
             use_cache=use_cache,
             **kwargs
         )
-        hidden_states = samba_outputs[0]
+        hidden_states = outputs[0]
         fuse_linear_and_cross_entropy = self.config.fuse_cross_entropy and self.training
-        logits = None if fuse_linear_and_cross_entropy else self.lm_head(hidden_states[:, -num_logits_to_keep:])
 
-        loss = None
+        loss, logits = None, None
+        if not fuse_linear_and_cross_entropy or labels is None:
+            logits = self.lm_head(hidden_states[:, -num_logits_to_keep:])
         if labels is not None:
-            if self.config.fuse_cross_entropy:
+            if getattr(self, 'criterion', None) is None:
                 if fuse_linear_and_cross_entropy:
-                    loss_fct = FusedLinearCrossEntropyLoss()
+                    criterion = FusedLinearCrossEntropyLoss()
+                elif self.config.fuse_cross_entropy:
+                    criterion = FusedCrossEntropyLoss(inplace_backward=True)
                 else:
-                    loss_fct = FusedCrossEntropyLoss(inplace_backward=True)
+                    criterion = nn.CrossEntropyLoss()
             else:
-                loss_fct = nn.CrossEntropyLoss()
-            # Enable model parallelism
+                criterion = self.criterion
             labels = labels.to(hidden_states.device)
-            labels = torch.cat((labels[..., 1:], torch.full_like(labels[:, :1], loss_fct.ignore_index)), 1)
+            labels = torch.cat((labels[..., 1:], torch.full_like(labels[:, :1], criterion.ignore_index)), 1)
             if fuse_linear_and_cross_entropy:
-                loss = loss_fct(hidden_states.view(-1, self.config.hidden_size),
-                                labels.view(-1),
-                                self.lm_head.weight,
-                                self.lm_head.bias)
+                loss = criterion(hidden_states, labels, self.lm_head.weight, self.lm_head.bias)
             else:
-                loss = loss_fct(logits.view(-1, self.config.vocab_size), labels.view(-1))
+                loss = criterion(logits.view(labels.numel(), -1), labels.view(-1))
 
         if not return_dict:
-            output = (logits,) + samba_outputs[1:]
+            output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
 
         return SambaCausalLMOutput(
             loss=loss,
             logits=logits,
-            cache_params=samba_outputs.cache_params,
-            hidden_states=samba_outputs.hidden_states,
+            cache_params=outputs.cache_params,
+            hidden_states=outputs.hidden_states,
         )

@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.utils.checkpoint
-from transformers.activations import ACT2FN
 from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import (BaseModelOutputWithPast,
                                            CausalLMOutputWithPast)
@@ -20,9 +19,9 @@ from fla.layers.attn import Attention
 from fla.layers.gla import GatedLinearAttention
 from fla.models.gla.configuration_gla import GLAConfig
 from fla.models.utils import Cache
-from fla.modules import (FusedCrossEntropyLoss, FusedLinearCrossEntropyLoss,
-                         RMSNorm)
-from fla.modules.activations import swiglu_linear
+from fla.modules import FusedCrossEntropyLoss, FusedLinearCrossEntropyLoss
+from fla.modules import GatedMLP as GLAMLP
+from fla.modules import RMSNorm
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
@@ -30,53 +29,20 @@ if TYPE_CHECKING:
 logger = logging.get_logger(__name__)
 
 
-class GLAMLP(nn.Module):
-
-    def __init__(
-        self,
-        hidden_size: int,
-        hidden_ratio: Optional[int] = None,
-        intermediate_size: Optional[int] = None,
-        hidden_act: str = 'swish'
-    ) -> GLAMLP:
-        super().__init__()
-
-        self.hidden_size = hidden_size
-        # the final number of params is `hidden_ratio * hidden_size^2`
-        # `intermediate_size` is chosen to be a multiple of 256 closest to `2/3 * hidden_size * hidden_ratio`
-        if hidden_ratio is None:
-            hidden_ratio = 4
-        if intermediate_size is None:
-            intermediate_size = int(hidden_size * hidden_ratio * 2 / 3)
-            intermediate_size = 256 * ((intermediate_size + 256 - 1) // 256)
-        self.hidden_ratio = hidden_ratio
-        self.intermediate_size = intermediate_size
-
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size * 2, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        self.act_fn = ACT2FN[hidden_act]
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        **kwargs: Unpack[Dict],
-    ) -> torch.Tensor:
-        y = self.gate_proj(x)
-        gate, y = y.chunk(2, -1)
-        return swiglu_linear(gate, y, self.down_proj.weight, self.down_proj.bias)
-
-
 class GLABlock(nn.Module):
     def __init__(self, config: GLAConfig, layer_idx: int):
         super().__init__()
-        self.hidden_size = config.hidden_size
 
-        self.attn_norm = RMSNorm(hidden_size=config.hidden_size, eps=config.norm_eps)
+        self.config = config
+        self.layer_idx = layer_idx
+
+        self.attn_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(config.hidden_size, eps=config.norm_eps)
         if config.attn is not None and layer_idx in config.attn['layers']:
             self.attn = Attention(
                 hidden_size=config.hidden_size,
                 num_heads=config.attn['num_heads'],
                 num_kv_heads=config.attn['num_kv_heads'],
+                qkv_bias=config.attn['qkv_bias'],
                 window_size=config.attn['window_size'],
                 rope_theta=config.attn['rope_theta'],
                 max_position_embeddings=config.max_position_embeddings,
@@ -101,12 +67,13 @@ class GLABlock(nn.Module):
                 fuse_norm=config.fuse_norm,
                 layer_idx=layer_idx
             )
-        self.mlp_norm = RMSNorm(hidden_size=config.hidden_size, eps=config.norm_eps)
+        self.mlp_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(config.hidden_size, eps=config.norm_eps)
         self.mlp = GLAMLP(
             hidden_size=config.hidden_size,
             hidden_ratio=config.hidden_ratio,
             intermediate_size=config.intermediate_size,
-            hidden_act=config.hidden_act
+            hidden_act=config.hidden_act,
+            fuse_swiglu=config.fuse_swiglu
         )
 
     def forward(
@@ -128,7 +95,12 @@ class GLABlock(nn.Module):
             output_attentions=output_attentions,
             **kwargs
         )
-        hidden_states, residual = self.mlp_norm(hidden_states, residual, True)
+        if self.config.fuse_norm:
+            hidden_states, residual = self.mlp_norm(hidden_states, residual, True)
+        else:
+            hidden_states = residual + hidden_states
+            residual = hidden_states
+            hidden_states = self.mlp_norm(hidden_states)
         hidden_states = self.mlp(hidden_states, **kwargs)
         hidden_states = residual + hidden_states
 
@@ -193,7 +165,7 @@ class GLAModel(GLAPreTrainedModel):
 
         self.embeddings = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList([GLABlock(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
-        self.norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
+        self.norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(config.hidden_size, eps=config.norm_eps)
 
         self.gradient_checkpointing = False
 
@@ -296,6 +268,7 @@ class GLAForCausalLM(GLAPreTrainedModel, GenerationMixin):
         self.model = GLAModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.criterion = None
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -401,27 +374,26 @@ class GLAForCausalLM(GLAPreTrainedModel, GenerationMixin):
 
         hidden_states = outputs[0]
         fuse_linear_and_cross_entropy = self.config.fuse_cross_entropy and self.training
-        logits = None if fuse_linear_and_cross_entropy else self.lm_head(hidden_states[:, -num_logits_to_keep:])
 
-        loss = None
+        loss, logits = None, None
+        if not fuse_linear_and_cross_entropy or labels is None:
+            logits = self.lm_head(hidden_states[:, -num_logits_to_keep:])
         if labels is not None:
-            if self.config.fuse_cross_entropy:
+            if getattr(self, 'criterion', None) is None:
                 if fuse_linear_and_cross_entropy:
-                    loss_fct = FusedLinearCrossEntropyLoss()
+                    criterion = FusedLinearCrossEntropyLoss()
+                elif self.config.fuse_cross_entropy:
+                    criterion = FusedCrossEntropyLoss(inplace_backward=True)
                 else:
-                    loss_fct = FusedCrossEntropyLoss(inplace_backward=True)
+                    criterion = nn.CrossEntropyLoss()
             else:
-                loss_fct = nn.CrossEntropyLoss()
-            # Enable model parallelism
+                criterion = self.criterion
             labels = labels.to(hidden_states.device)
-            labels = torch.cat((labels[..., 1:], torch.full_like(labels[:, :1], loss_fct.ignore_index)), 1)
+            labels = torch.cat((labels[..., 1:], torch.full_like(labels[:, :1], criterion.ignore_index)), 1)
             if fuse_linear_and_cross_entropy:
-                loss = loss_fct(hidden_states.view(-1, self.config.hidden_size),
-                                labels.view(-1),
-                                self.lm_head.weight,
-                                self.lm_head.bias)
+                loss = criterion(hidden_states, labels, self.lm_head.weight, self.lm_head.bias)
             else:
-                loss = loss_fct(logits.view(-1, self.config.vocab_size), labels.view(-1))
+                loss = criterion(logits.view(labels.numel(), -1), labels.view(-1))
 
         if not return_dict:
             output = (logits,) + outputs[1:]

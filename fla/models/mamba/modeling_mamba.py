@@ -472,7 +472,12 @@ class MambaPreTrainedModel(PreTrainedModel):
 
     def _init_weights(self, module):
         """Initialize the weights."""
-        if isinstance(module, MambaMixer):
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
+            if module.bias is not None:
+                if not getattr(module.bias, "_no_reinit", False):
+                    nn.init.zeros_(module.bias)
+        elif isinstance(module, MambaMixer):
             module.A_log._no_weight_decay = True
             module.D._no_weight_decay = True
 
@@ -490,15 +495,12 @@ class MambaPreTrainedModel(PreTrainedModel):
             # # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
             inv_dt = dt + torch.log(-torch.expm1(-dt))
             with torch.no_grad():
-                module.dt_proj.bias.copy_(inv_dt)
+                module.dt_proj.bias.data = nn.Parameter(inv_dt.to(module.dt_proj.bias.device))
             module.dt_proj.bias._no_reinit = True
-
-        if isinstance(module, nn.Linear):
-            if module.bias is not None:
-                if not getattr(module.bias, "_no_reinit", False):
-                    nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, std=self.config.initializer_range)
+        elif hasattr(module, 'reset_parameters'):
+            module.reset_parameters()
 
         if self.config.rescale_prenorm_residual:
             # Reinitialize selected weights subject to the OpenAI GPT-2 Paper Scheme:
@@ -685,6 +687,8 @@ class MambaForCausalLM(MambaPreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.backbone = MambaModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.criterion = None
+
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -805,27 +809,27 @@ class MambaForCausalLM(MambaPreTrainedModel, GenerationMixin):
         )
         hidden_states = mamba_outputs[0]
         fuse_linear_and_cross_entropy = self.config.fuse_cross_entropy and self.training
-        logits = None if fuse_linear_and_cross_entropy else self.lm_head(hidden_states[:, -num_logits_to_keep:])
 
-        loss = None
+        loss, logits = None, None
+        if not fuse_linear_and_cross_entropy or labels is None:
+            logits = self.lm_head(hidden_states[:, -num_logits_to_keep:])
         if labels is not None:
-            if self.config.fuse_cross_entropy:
+            if getattr(self, 'criterion', None) is None:
                 if fuse_linear_and_cross_entropy:
-                    loss_fct = FusedLinearCrossEntropyLoss()
+                    criterion = FusedLinearCrossEntropyLoss()
+                elif self.config.fuse_cross_entropy:
+                    criterion = FusedCrossEntropyLoss(inplace_backward=True)
                 else:
-                    loss_fct = FusedCrossEntropyLoss(inplace_backward=True)
+                    criterion = nn.CrossEntropyLoss()
             else:
-                loss_fct = nn.CrossEntropyLoss()
+                criterion = self.criterion
             # Enable model parallelism
             labels = labels.to(hidden_states.device)
-            labels = torch.cat((labels[..., 1:], torch.full_like(labels[:, :1], loss_fct.ignore_index)), 1)
+            labels = torch.cat((labels[..., 1:], torch.full_like(labels[:, :1], criterion.ignore_index)), 1)
             if fuse_linear_and_cross_entropy:
-                loss = loss_fct(hidden_states.view(-1, self.config.hidden_size),
-                                labels.view(-1),
-                                self.lm_head.weight,
-                                self.lm_head.bias)
+                loss = criterion(hidden_states, labels, self.lm_head.weight, self.lm_head.bias)
             else:
-                loss = loss_fct(logits.view(-1, self.config.vocab_size), labels.view(-1))
+                loss = criterion(logits.view(labels.numel(), -1), labels.view(-1))
 
         if not return_dict:
             output = (logits,) + mamba_outputs[1:]

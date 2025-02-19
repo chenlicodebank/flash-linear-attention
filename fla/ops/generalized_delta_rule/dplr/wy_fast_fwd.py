@@ -8,6 +8,7 @@ import torch
 import triton
 import triton.language as tl
 
+
 @triton.heuristics({
     'USE_OFFSETS': lambda args: args['offsets'] is not None
 })
@@ -16,18 +17,18 @@ import triton.language as tl
         triton.Config({}, num_warps=num_warps)
         for num_warps in [1, 2, 4, 8, 16]
     ],
-    key=["BT"]
+    key=['BT']
 )
-@triton.jit
+@triton.jit(do_not_specialize=['T'])
 def fwd_prepare_wy_repr_kernel_chunk32(
     A_ab,
-    A_ab_inv, 
+    A_ab_inv,
     offsets,
     indices,
-    T: tl.constexpr,
+    T,
     H: tl.constexpr,
     BT: tl.constexpr,
-    BC: tl.constexpr, #placeholder, do not delete
+    BC: tl.constexpr,  # placeholder, do not delete
     USE_OFFSETS: tl.constexpr,
     HEAD_FIRST: tl.constexpr,
 ):
@@ -54,7 +55,7 @@ def fwd_prepare_wy_repr_kernel_chunk32(
         b_A_ab = tl.where(mask[:, None], b_a, b_A_ab)
     b_A_ab += tl.arange(0, BT)[:, None] == tl.arange(0, BT)[None, :]
     tl.store(p_Aab_inv, b_A_ab.to(p_Aab_inv.dtype.element_ty), boundary_check=(0, 1))
-    
+
 
 @triton.heuristics({
     'USE_OFFSETS': lambda args: args['offsets'] is not None
@@ -65,15 +66,15 @@ def fwd_prepare_wy_repr_kernel_chunk32(
         for num_warps in [2, 4, 8]
         for num_stages in [2, 3, 4]
     ],
-    key=["BC"]
+    key=['BC']
 )
-@triton.jit
+@triton.jit(do_not_specialize=['T'])
 def fwd_prepare_wy_repr_kernel_chunk64(
     A_ab,
     A_ab_inv,
     offsets,
     indices,
-    T: tl.constexpr,
+    T,
     H: tl.constexpr,
     BT: tl.constexpr,
     BC: tl.constexpr,
@@ -143,9 +144,9 @@ def fwd_prepare_wy_repr_kernel_chunk64(
         triton.Config({}, num_warps=num_warps)
         for num_warps in [2, 4]
     ],
-    key=["BT", "BK", "BV"]
+    key=['BT', 'BK', 'BV']
 )
-@triton.jit
+@triton.jit(do_not_specialize=['T'])
 def fwd_wu_kernel(
     u,
     w,
@@ -155,7 +156,7 @@ def fwd_wu_kernel(
     A_ak,
     offsets,
     indices,
-    T: tl.constexpr,
+    T,
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
@@ -201,7 +202,6 @@ def fwd_wu_kernel(
         b_ag = tl.load(p_ag, boundary_check=(0, 1))
         b_w = tl.dot(b_Aab_inv.to(b_ag.dtype), b_ag, allow_tf32=False)
         tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
- 
 
     for i_v in range(tl.cdiv(V, BV)):
         if HEAD_FIRST:
@@ -312,5 +312,3 @@ def fwd_wu(
         HEAD_FIRST=head_first
     )
     return w, u
-
-
